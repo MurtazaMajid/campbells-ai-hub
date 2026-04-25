@@ -1,23 +1,25 @@
 """
 Campbell's Restaurant — AI Marketing System
-FastAPI Backend v3.0 — Full with Analysis Endpoints
+FastAPI Backend v4.0 — Full with Analysis + Customer Profiling (Section 5)
 
 Endpoints:
-  GET  /                              → health check
-  POST /api/segment                   → customer segment
-  POST /api/churn                     → churn probability + risk level
-  POST /api/sentiment                 → ABSA triplets from review
-  POST /api/generate-message          → personalized SMS + email + app notification
-  POST /api/full-pipeline             → all of the above in one call
-  GET  /api/dashboard                 → full stats (live from Supabase)
-  GET  /api/customers                 → paginated customer list
-  GET  /api/messages-log             → recent generated messages
-  GET  /api/analysis/kpis            → all KPI numbers
-  GET  /api/analysis/rfm             → RFM scatter data
-  GET  /api/analysis/churn-distribution → churn histogram + by segment
-  GET  /api/analysis/monthly-visits  → visits by month
-  GET  /api/analysis/revenue         → revenue breakdown
-  GET  /api/analysis/sentiment-breakdown → ABSA charts data
+  GET  /                                  → health check
+  POST /api/segment                       → customer segment
+  POST /api/churn                         → churn probability + risk level
+  POST /api/sentiment                     → ABSA triplets from review
+  POST /api/generate-message              → enriched personalized SMS + email + app notification
+  POST /api/full-pipeline                 → all of the above in one call (auto-fetches profile from DB)
+  GET  /api/dashboard                     → full stats (live from Supabase)
+  GET  /api/customers                     → paginated customer list
+  GET  /api/messages-log                  → recent generated messages
+  GET  /api/customer-profile/{id}         → full enriched profile for one customer
+  GET  /api/analysis/kpis                 → all KPI numbers
+  GET  /api/analysis/rfm                  → RFM scatter data
+  GET  /api/analysis/churn-distribution   → churn histogram + by segment
+  GET  /api/analysis/monthly-visits       → visits by month
+  GET  /api/analysis/revenue              → revenue breakdown
+  GET  /api/analysis/sentiment-breakdown  → ABSA charts data
+  GET  /api/analysis/profiles             → Section 5 spending tier / time / food breakdowns
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -51,7 +53,7 @@ warnings.filterwarnings('ignore')
 app = FastAPI(
     title       = "Campbell's AI Marketing API",
     description = "Churn Prediction · Customer Segmentation · ABSA · Personalized Messages",
-    version     = "3.0.0"
+    version     = "4.0.0"
 )
 
 app.add_middleware(
@@ -103,8 +105,9 @@ class CustomerRequest(BaseModel):
 class SentimentRequest(BaseModel):
     review: str
 
+# UPDATED: MessageRequest now includes Section 5 profile fields
 class MessageRequest(BaseModel):
-    customer_id      : Optional[str]      = None
+    customer_id      : Optional[str]       = None
     segment          : str
     recency          : float
     frequency        : int
@@ -114,7 +117,15 @@ class MessageRequest(BaseModel):
     favorite_items   : Optional[List[str]] = []
     aspects          : Optional[List[str]] = []
     sentiments       : Optional[List[str]] = []
+    # Section 5 enriched profile fields
+    spending_tier    : Optional[str]  = "Standard"
+    time_preference  : Optional[str]  = "Evening"
+    food_preference  : Optional[str]  = "varied"
+    drink_vs_food    : Optional[str]  = "Mixed"
+    favorite_modifier: Optional[str]  = None
+    is_flight_lover  : Optional[bool] = False
 
+# UPDATED: FullPipelineRequest now includes Section 5 profile fields
 class FullPipelineRequest(BaseModel):
     recency         : float
     frequency       : int
@@ -130,6 +141,13 @@ class FullPipelineRequest(BaseModel):
     favorite_items  : Optional[List[str]] = []
     review          : Optional[str]       = None
     customer_id     : Optional[str]       = None
+    # Section 5 profile fields (auto-fetched from DB if customer_id given and these are None)
+    spending_tier    : Optional[str]  = None
+    time_preference  : Optional[str]  = None
+    food_preference  : Optional[str]  = None
+    drink_vs_food    : Optional[str]  = None
+    favorite_modifier: Optional[str]  = None
+    is_flight_lover  : Optional[bool] = None
 
 # ─────────────────────────────────────────────
 # MODEL STORE
@@ -149,9 +167,9 @@ def load_models():
         with open(f"{DATA_DIR}/mlb.pkl",               'rb') as f: models['mlb']         = pickle.load(f)
         with open(f"{DATA_DIR}/sentiment_model.pkl",   'rb') as f: models['sentiment']   = pickle.load(f)
         with open(f"{DATA_DIR}/tfidf_sent.pkl",        'rb') as f: models['tfidf_sent']  = pickle.load(f)
-        print("✅ All models loaded successfully")
+        print("All models loaded successfully")
     except FileNotFoundError as e:
-        print(f"⚠️  Model file not found: {e}")
+        print(f"Model file not found: {e}")
 
 def load_menu():
     try:
@@ -159,7 +177,7 @@ def load_menu():
         ws      = wb.active
         rows    = list(ws.iter_rows(values_only=True))
         menu_df = pd.DataFrame(rows[1:], columns=rows[0])
-        food_cats = ['Signature Flights','Brunch Food','Entrées','Desserts',
+        food_cats = ['Signature Flights','Brunch Food','Entrees','Desserts',
                      'Salads','Burgers & Sandwiches','Kids Menu',
                      'Sides Dinner','Sides Brunch','Weekly Specials']
         return menu_df[menu_df['Category'].isin(food_cats)].dropna(subset=['itemName','itemPrice'])
@@ -169,7 +187,7 @@ def load_menu():
 menu_df = pd.DataFrame()
 
 # ─────────────────────────────────────────────
-# SUPABASE TABLE SQL
+# SUPABASE TABLE CREATION SQL
 # ─────────────────────────────────────────────
 CREATE_CUSTOMERS_SQL = """
 CREATE TABLE IF NOT EXISTS customers (
@@ -190,6 +208,13 @@ CREATE TABLE IF NOT EXISTS customers (
     risk_level        TEXT,
     tier              TEXT,
     discount_offered  TEXT,
+    spending_tier     TEXT DEFAULT 'Standard',
+    time_preference   TEXT DEFAULT 'Evening',
+    food_preference   TEXT DEFAULT 'varied',
+    drink_vs_food     TEXT DEFAULT 'Mixed',
+    favorite_modifier TEXT,
+    is_flight_lover   BOOLEAN DEFAULT FALSE,
+    favorite_items    TEXT,
     created_at        TIMESTAMPTZ DEFAULT NOW(),
     updated_at        TIMESTAMPTZ DEFAULT NOW()
 );"""
@@ -201,6 +226,8 @@ CREATE TABLE IF NOT EXISTS messages_log (
     segment          TEXT,
     risk_level       TEXT,
     discount_offered TEXT,
+    spending_tier    TEXT,
+    time_preference  TEXT,
     sms              TEXT,
     email_subject    TEXT,
     email_body       TEXT,
@@ -212,21 +239,22 @@ CREATE TABLE IF NOT EXISTS messages_log (
 
 CREATE_ABSA_SQL = """
 CREATE TABLE IF NOT EXISTS absa_predictions (
-    id          BIGSERIAL PRIMARY KEY,
-    customer_id TEXT,
-    review      TEXT,
-    aspects     TEXT,
-    sentiments  TEXT,
-    opinions    TEXT,
-    triplets    JSONB,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    id               BIGSERIAL PRIMARY KEY,
+    customer_id      TEXT,
+    review           TEXT,
+    aspects          TEXT,
+    sentiments       TEXT,
+    feature_opinion  TEXT,
+    opinions         TEXT,
+    triplets         JSONB,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
 );"""
 
 def ensure_tables_via_api():
     service_key = os.getenv("SUPABASE_SERVICE_KEY", "")
     project_ref = SUPABASE_URL.replace("https://", "").replace(".supabase.co", "")
     if not service_key:
-        print("⚠️  SUPABASE_SERVICE_KEY not set — skipping auto table creation.")
+        print("SUPABASE_SERVICE_KEY not set - skipping auto table creation.")
         return False
     all_sql = "\n".join([CREATE_CUSTOMERS_SQL, CREATE_MESSAGES_LOG_SQL, CREATE_ABSA_SQL])
     url     = f"https://api.supabase.com/v1/projects/{project_ref}/database/query"
@@ -234,29 +262,29 @@ def ensure_tables_via_api():
     try:
         resp = requests.post(url, headers=headers, json={"query": all_sql}, timeout=30)
         if resp.status_code in (200, 201):
-            print("✅ Tables created via Management API")
+            print("Tables created via Management API")
             return True
-        print(f"⚠️  Management API {resp.status_code}: {resp.text[:200]}")
+        print(f"Management API {resp.status_code}: {resp.text[:200]}")
         return False
     except Exception as e:
-        print(f"⚠️  Management API error: {e}")
+        print(f"Management API error: {e}")
         return False
 
 def seed_customers_from_csv():
     csv_path = f"{DATA_DIR}/churn_scores_final.csv"
     if not os.path.exists(csv_path):
-        print(f"⚠️  {csv_path} not found — skipping seed.")
+        print(f"{csv_path} not found - skipping seed.")
         return 0
     df = pd.read_csv(csv_path)
     try:
         sb    = get_supabase()
         check = sb.table("customers").select("id", count="exact").execute()
         if check.count and check.count >= len(df):
-            print(f"ℹ️  customers already has {check.count} rows — skipping seed")
+            print(f"customers already has {check.count} rows - skipping seed")
             return check.count
     except:
         pass
-    print(f"📦 Seeding {len(df)} customers...")
+    print(f"Seeding {len(df)} customers...")
     col_map = {
         'Last 4 Card Digits':'id','Segment':'segment','Recency':'recency',
         'Frequency':'frequency','Monetary':'monetary','Unique_Items':'unique_items',
@@ -285,8 +313,8 @@ def seed_customers_from_csv():
             sb.table("customers").upsert(records[i:i+500], on_conflict="id").execute()
             seeded += len(records[i:i+500])
         except Exception as e:
-            print(f"⚠️  Seed batch error: {e}")
-    print(f"✅ Seeded {seeded} customers")
+            print(f"Seed batch error: {e}")
+    print(f"Seeded {seeded} customers")
     return seeded
 
 # ─────────────────────────────────────────────
@@ -297,7 +325,7 @@ async def startup_event():
     global menu_df
     load_models()
     menu_df = load_menu()
-    print(f"✅ Menu loaded: {len(menu_df)} items")
+    print(f"Menu loaded: {len(menu_df)} items")
     ensure_tables_via_api()
     seed_customers_from_csv()
 
@@ -398,43 +426,88 @@ def call_groq(prompt: str) -> str:
     resp.raise_for_status()
     return resp.json()['choices'][0]['message']['content']
 
+# UPDATED: generate_message now uses Section 5 enriched profile
 def generate_message(req: MessageRequest) -> dict:
-    discount   = DISCOUNT_MAP.get(req.risk_level, 15)
-    liked      = [a for a, s in zip(req.aspects or [], req.sentiments or []) if s == 'positive']
-    disliked   = [a for a, s in zip(req.aspects or [], req.sentiments or []) if s == 'negative']
+    discount = DISCOUNT_MAP.get(req.risk_level, 15)
+    liked    = [a for a, s in zip(req.aspects or [], req.sentiments or []) if s == 'positive']
+    disliked = [a for a, s in zip(req.aspects or [], req.sentiments or []) if s == 'negative']
+
+    # Build menu highlights matched to customer's food preference
     highlights = []
     if not menu_df.empty:
-        highlights = menu_df.sample(min(3, len(menu_df)))[['itemName','itemPrice','Category']].to_dict('records')
-    prompt = f"""You are a warm, friendly marketing assistant for Campbell's Restaurant.
+        food_pref = (req.food_preference or 'varied').lower()
+        if food_pref != 'varied':
+            matching = menu_df[menu_df['itemName'].str.lower().str.contains(food_pref, na=False)]
+            if len(matching) > 0:
+                highlights = matching.sample(min(2, len(matching)))[['itemName','itemPrice','Category']].to_dict('records')
+        if len(highlights) < 3:
+            extra = menu_df.sample(min(3 - len(highlights), len(menu_df)))[['itemName','itemPrice','Category']].to_dict('records')
+            highlights.extend(extra)
+
+    # Build persona notes from Section 5 fields
+    persona_notes = []
+    tier         = req.spending_tier    or 'Standard'
+    time_pref    = req.time_preference  or 'Evening'
+    drink_food   = req.drink_vs_food    or 'Mixed'
+    flight_lover = req.is_flight_lover  or False
+    food_pref    = req.food_preference  or 'varied'
+    modifier     = req.favorite_modifier
+
+    if tier == 'Premium':         persona_notes.append("VIP Premium spender - treat them like royalty, use luxury language")
+    elif tier == 'Economy':       persona_notes.append("Value-conscious - lead with the deal, make savings feel big")
+    if time_pref == 'Evening':    persona_notes.append("Evening regular - reference their night-out vibe naturally")
+    elif time_pref == 'Morning':  persona_notes.append("Morning person - brunch/breakfast items may appeal")
+    elif time_pref == 'Mid-day':  persona_notes.append("Lunch crowd regular - highlight midday specials")
+    if drink_food == 'Drinks':    persona_notes.append("Drinks-focused - highlight cocktail and drink flights")
+    elif drink_food == 'Food':    persona_notes.append("Food-focused - highlight food items over drinks")
+    if flight_lover:              persona_notes.append("LOVES flights - use flight/aviation puns (cleared for takeoff, fly back, boarding)")
+    if modifier:                  persona_notes.append(f"Always orders with {modifier} - mention it by name")
+    if food_pref != 'varied':     persona_notes.append(f"Loves {food_pref} dishes - recommend {food_pref} items from menu")
+    if disliked:                  persona_notes.append(f"Previously unhappy with {', '.join(disliked)} - subtly acknowledge improvement")
+
+    prompt = f"""You are a warm, creative marketing copywriter for Campbell's Restaurant.
 
 CUSTOMER PROFILE:
-- Segment            : {req.segment}
+- Segment              : {req.segment}
 - Days since last visit: {int(req.recency)} days
-- Total visits       : {req.frequency}
-- Total spent        : ${req.monetary:.2f}
-- Churn risk         : {req.risk_level}
-- Liked aspects      : {liked if liked else 'unknown'}
-- Disliked aspects   : {disliked if disliked else 'none noted'}
-- Favorite items     : {req.favorite_items}
+- Total visits         : {req.frequency}
+- Total spent          : ${req.monetary:.2f}
+- Churn risk           : {req.risk_level}
+- Spending tier        : {tier}
+- Favorite items       : {req.favorite_items or []}
+- Preferred time       : {time_pref}
+- Preference type      : {drink_food} person
+- Food loves           : {food_pref}
+- Favorite modifier    : {modifier if modifier else 'not specified'}
+- Flight lover         : {'Yes - use flight puns!' if flight_lover else 'Not particularly'}
+- Liked aspects        : {liked if liked else 'unknown'}
+- Disliked aspects     : {disliked if disliked else 'none noted'}
 
-MENU HIGHLIGHTS:
+PERSONA NOTES (follow these carefully):
+{chr(10).join(f'- {note}' for note in persona_notes)}
+
+MENU HIGHLIGHTS (pick what fits the customer):
 {json.dumps(highlights, indent=2)}
 
 DISCOUNT TO OFFER: {discount}% off next visit
 
-Return ONLY this JSON:
+Return ONLY this JSON object:
 {{
   "sms": "...",
   "email": {{"subject": "...", "body": "..."}},
   "app_notification": "..."
 }}
 
-RULES:
-- SMS: max 160 chars, casual and punchy
-- Email: warm, personal, 3-4 short paragraphs
-- App notification: max 80 chars, exciting
-- Tone: Lost→urgent, New→welcoming, Occasional→appreciative, Regular→VIP
-- NEVER mention churn, AI, or risk scores"""
+WRITING RULES:
+- SMS: max 160 chars, reference their specific preferences, punchy
+- Email: warm, personal, 3-4 short paragraphs, mention their favorites + modifier if known
+- App notification: max 80 chars, include 1 relevant emoji
+- Reference their TIME preference naturally (evening rush, morning crowd etc.)
+- Spending tier tone: Premium = VIP language, Economy = savings-first language
+- If flight lover: use puns like 'cleared for takeoff', 'fly back', 'your table is boarding'
+- Include the {discount}% discount clearly and naturally
+- Tone by segment: Lost = urgent miss you, New = welcoming, Occasional = appreciate loyalty, Regular = VIP
+- NEVER mention churn, AI, data analysis, or risk scores"""
 
     response = call_groq(prompt)
     try:
@@ -473,7 +546,7 @@ def upsert_customer_to_db(customer_id, segment, req, churn):
             "updated_at"       : datetime.now(timezone.utc).isoformat(),
         }, on_conflict="id").execute()
     except Exception as e:
-        print(f"⚠️  Customer upsert failed: {e}")
+        print(f"Customer upsert failed: {e}")
 
 def log_message_to_db(customer_id, req: MessageRequest, messages: dict, absa):
     sb    = get_supabase()
@@ -484,6 +557,8 @@ def log_message_to_db(customer_id, req: MessageRequest, messages: dict, absa):
             "segment"         : req.segment,
             "risk_level"      : req.risk_level,
             "discount_offered": f"{DISCOUNT_MAP.get(req.risk_level, 15)}%",
+            "spending_tier"   : req.spending_tier,
+            "time_preference" : req.time_preference,
             "sms"             : messages.get("sms", ""),
             "email_subject"   : email.get("subject", "") if isinstance(email, dict) else "",
             "email_body"      : email.get("body", "")    if isinstance(email, dict) else "",
@@ -492,21 +567,22 @@ def log_message_to_db(customer_id, req: MessageRequest, messages: dict, absa):
             "sentiments"      : json.dumps(absa['sentiments'] if absa else []),
         }).execute()
     except Exception as e:
-        print(f"⚠️  Message log failed: {e}")
+        print(f"Message log failed: {e}")
 
 def log_absa_to_db(customer_id, review: str, absa: dict):
     sb = get_supabase()
     try:
         sb.table("absa_predictions").insert({
-            "customer_id": str(customer_id) if customer_id else None,
-            "review"     : review,
-            "aspects"    : json.dumps(absa['aspects']),
-            "sentiments" : json.dumps(absa['sentiments']),
-            "opinions"   : json.dumps(absa['opinions']),
-            "triplets"   : json.dumps(absa['triplets']),
+            "customer_id"    : str(customer_id) if customer_id else None,
+            "review"         : review,
+            "aspects"        : json.dumps(absa['aspects']),
+            "sentiments"     : json.dumps(absa['sentiments']),
+            "feature_opinion": json.dumps(absa['opinions']),
+            "opinions"       : json.dumps(absa['opinions']),
+            "triplets"       : json.dumps(absa['triplets']),
         }).execute()
     except Exception as e:
-        print(f"⚠️  ABSA log failed: {e}")
+        print(f"ABSA log failed: {e}")
 
 # ─────────────────────────────────────────────
 # CORE ENDPOINTS
@@ -516,7 +592,7 @@ def health_check():
     return {
         "status"       : "ok",
         "service"      : "Campbell's AI Marketing API",
-        "version"      : "3.0.0",
+        "version"      : "4.0.0",
         "models_loaded": list(models.keys()),
         "supabase"     : SUPABASE_URL != "YOUR_SUPABASE_URL_HERE"
     }
@@ -562,15 +638,72 @@ def generate_personalized_message(req: MessageRequest):
         "messages"        : messages
     }
 
+# UPDATED: full_pipeline auto-fetches Section 5 profile from Supabase by customer_id
 @app.post("/api/full-pipeline")
 def full_pipeline(req: FullPipelineRequest):
     segment   = get_segment(req.recency, req.frequency, req.monetary)
-    churn_req = CustomerRequest(**req.dict(exclude={"review", "customer_id"}))
-    churn     = get_churn_score(churn_req, segment)
-    absa      = None
+    churn_req = CustomerRequest(
+        recency         = req.recency,
+        frequency       = req.frequency,
+        monetary        = req.monetary,
+        unique_items    = req.unique_items,
+        avg_order_val   = req.avg_order_val,
+        avg_tip         = req.avg_tip,
+        discount_used   = req.discount_used,
+        visits_nov      = req.visits_nov,
+        visits_dec      = req.visits_dec,
+        visits_jan      = req.visits_jan,
+        days_since_first= req.days_since_first,
+        favorite_items  = req.favorite_items,
+    )
+    churn = get_churn_score(churn_req, segment)
+
+    absa = None
     if req.review:
         absa = run_absa(req.review)
         log_absa_to_db(req.customer_id, req.review, absa)
+
+    # Resolve Section 5 profile: request body > Supabase DB > defaults
+    spending_tier    = req.spending_tier
+    time_preference  = req.time_preference
+    food_preference  = req.food_preference
+    drink_vs_food    = req.drink_vs_food
+    favorite_modifier= req.favorite_modifier
+    is_flight_lover  = req.is_flight_lover
+    fav_items        = req.favorite_items or []
+
+    if req.customer_id:
+        try:
+            sb   = get_supabase()
+            resp = sb.table("customers").select(
+                "spending_tier,time_preference,food_preference,drink_vs_food,"
+                "favorite_modifier,is_flight_lover,favorite_items"
+            ).eq("id", str(req.customer_id)).limit(1).execute()
+            if resp.data:
+                row = resp.data[0]
+                if spending_tier    is None: spending_tier    = row.get("spending_tier")
+                if time_preference  is None: time_preference  = row.get("time_preference")
+                if food_preference  is None: food_preference  = row.get("food_preference")
+                if drink_vs_food    is None: drink_vs_food    = row.get("drink_vs_food")
+                if favorite_modifier is None: favorite_modifier = row.get("favorite_modifier")
+                if is_flight_lover  is None: is_flight_lover  = bool(row.get("is_flight_lover", False))
+                if not fav_items:
+                    stored = row.get("favorite_items")
+                    if stored:
+                        try:
+                            fav_items = ast.literal_eval(stored) if isinstance(stored, str) else stored
+                        except:
+                            pass
+        except Exception as e:
+            print(f"Profile fetch error: {e}")
+
+    # Apply defaults if still None after DB lookup
+    spending_tier    = spending_tier    or 'Standard'
+    time_preference  = time_preference  or 'Evening'
+    food_preference  = food_preference  or 'varied'
+    drink_vs_food    = drink_vs_food    or 'Mixed'
+    is_flight_lover  = is_flight_lover  or False
+
     msg_req = MessageRequest(
         customer_id      = req.customer_id,
         segment          = segment,
@@ -579,23 +712,41 @@ def full_pipeline(req: FullPipelineRequest):
         monetary         = req.monetary,
         risk_level       = churn['risk_level'],
         churn_probability= churn['churn_probability'],
-        favorite_items   = req.favorite_items,
+        favorite_items   = fav_items,
         aspects          = absa['aspects']    if absa else [],
-        sentiments       = absa['sentiments'] if absa else []
+        sentiments       = absa['sentiments'] if absa else [],
+        spending_tier    = spending_tier,
+        time_preference  = time_preference,
+        food_preference  = food_preference,
+        drink_vs_food    = drink_vs_food,
+        favorite_modifier= favorite_modifier,
+        is_flight_lover  = is_flight_lover,
     )
     messages = generate_message(msg_req)
+
     upsert_customer_to_db(req.customer_id, segment, req, churn)
     log_message_to_db(req.customer_id, msg_req, messages, absa)
+
     return {
         "segment"          : segment,
         "churn_probability": churn['churn_probability'],
         "risk_level"       : churn['risk_level'],
         "tier"             : churn['tier'],
         "discount_offered" : f"{DISCOUNT_MAP.get(churn['risk_level'], 15)}%",
-        "absa"             : absa,
-        "messages"         : messages
+        "profile"          : {
+            "spending_tier"  : spending_tier,
+            "time_preference": time_preference,
+            "food_preference": food_preference,
+            "drink_vs_food"  : drink_vs_food,
+            "is_flight_lover": is_flight_lover,
+        },
+        "absa"    : absa,
+        "messages": messages
     }
 
+# ─────────────────────────────────────────────
+# DASHBOARD + DATA ENDPOINTS (identical to v3)
+# ─────────────────────────────────────────────
 @app.get("/api/dashboard")
 def get_dashboard_stats():
     sb = get_supabase()
@@ -607,7 +758,7 @@ def get_dashboard_stats():
         if not rows: raise ValueError("No data")
         df = pd.DataFrame(rows)
     except Exception as e:
-        print(f"⚠️  Supabase fallback: {e}")
+        print(f"Supabase fallback: {e}")
         try:
             df = pd.read_csv(f"{DATA_DIR}/churn_scores_final.csv")
             df = df.rename(columns={
@@ -617,7 +768,7 @@ def get_dashboard_stats():
         except:
             raise HTTPException(status_code=503, detail="No data available")
 
-    seg_counts     = df['segment'].value_counts().to_dict()   if 'segment'    in df.columns else {}
+    seg_counts     = df['segment'].value_counts().to_dict()    if 'segment'    in df.columns else {}
     risk_counts    = df['risk_level'].value_counts().to_dict() if 'risk_level' in df.columns else {}
     churn_rate     = round(float(df['churn_probability'].mean()) * 100, 2) if 'churn_probability' in df.columns else 0
     top_risk       = (
@@ -681,8 +832,23 @@ def get_messages_log(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
+# NEW: single customer full profile
+@app.get("/api/customer-profile/{customer_id}")
+def get_customer_profile(customer_id: str):
+    """Full enriched profile for one customer including all Section 5 fields."""
+    sb = get_supabase()
+    try:
+        resp = sb.table("customers").select("*").eq("id", customer_id).execute()
+        if not resp.data:
+            raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found")
+        return resp.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
 # ─────────────────────────────────────────────
-# ANALYSIS ENDPOINTS
+# ANALYSIS ENDPOINTS (identical to v3)
 # ─────────────────────────────────────────────
 @app.get("/api/analysis/kpis")
 def get_kpis():
@@ -890,4 +1056,65 @@ def get_sentiment_breakdown():
         "sample_reviews"       : df[['review','aspects','sentiment']].head(10).to_dict('records'),
         "total_reviews"        : len(df),
         "total_aspect_mentions": len(pairs_df)
+    }
+
+# NEW: Section 5 profile breakdown endpoint
+@app.get("/api/analysis/profiles")
+def get_profile_breakdown():
+    """
+    Spending tier / time preference / food preference / flight lover breakdowns.
+    Powers the Customer Profiling charts in the Analysis page.
+    """
+    sb = get_supabase()
+    try:
+        resp = sb.table("customers").select(
+            "spending_tier, time_preference, food_preference, drink_vs_food, is_flight_lover, segment"
+        ).limit(10000).execute()
+        rows = resp.data
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"DB error: {e}")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No profile data found")
+
+    df = pd.DataFrame(rows)
+
+    # Check whether Section 5 columns actually have real data
+    has_profiles = (
+        "spending_tier" in df.columns
+        and df["spending_tier"].notna().any()
+        and (df["spending_tier"] != "Standard").any()
+    )
+    if not has_profiles:
+        return {
+            "message"         : "Profile columns exist but Section 5 data not yet imported. Run profiles_update_only.csv import first.",
+            "spending_tiers"  : {},
+            "time_preferences": {},
+            "food_preferences": {},
+            "drink_vs_food"   : {},
+            "flight_lovers"   : 0,
+            "total_profiled"  : 0,
+        }
+
+    def vc(col):
+        return df[col].value_counts().to_dict() if col in df.columns else {}
+
+    flight_lovers = 0
+    if "is_flight_lover" in df.columns:
+        flight_lovers = int(df["is_flight_lover"].apply(
+            lambda x: bool(x) if x is not None else False
+        ).sum())
+
+    profile_by_segment = {}
+    if "segment" in df.columns and "spending_tier" in df.columns:
+        profile_by_segment = df.groupby("segment")["spending_tier"].value_counts().to_dict()
+
+    return {
+        "spending_tiers"    : vc("spending_tier"),
+        "time_preferences"  : vc("time_preference"),
+        "food_preferences"  : vc("food_preference"),
+        "drink_vs_food"     : vc("drink_vs_food"),
+        "flight_lovers"     : flight_lovers,
+        "profile_by_segment": profile_by_segment,
+        "total_profiled"    : len(df),
     }
