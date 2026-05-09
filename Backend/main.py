@@ -707,12 +707,12 @@ def send_email_via_resend(
     """
 
     try:
-       response = resend.Emails.send({
-    "from"   : "Campbell's AI Hub <onboarding@resend.dev>",
-    "to"     : ["murtazamajid.123@gmail.com"],
-    "subject": f"[To: {to_email}] {subject}",
-    "html"   : html_body,
-     })
+        response = resend.Emails.send({
+            "from"   : "Campbell's AI Hub <onboarding@resend.dev>",
+            "to"     : [to_email],
+            "subject": subject,
+            "html"   : html_body,
+        })
         print(f"Email sent to {to_email} | ID: {response.get('id', 'unknown')}")
         return {"success": True, "email_id": response.get("id"), "to": to_email}
     except Exception as e:
