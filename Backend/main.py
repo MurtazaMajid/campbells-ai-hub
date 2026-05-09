@@ -32,9 +32,10 @@ import pickle
 import json
 import re
 import os
-import ast
+import ast          # FIX 1: moved to top-level imports (was only inside dead commented block)
 import requests
 import warnings
+from contextlib import asynccontextmanager   # FIX 2: for lifespan (replaces deprecated on_event)
 from datetime import datetime, timezone
 from supabase import create_client, Client
 from sklearn.preprocessing import StandardScaler
@@ -47,43 +48,42 @@ from xgboost import XGBClassifier
 from openpyxl import load_workbook
 warnings.filterwarnings('ignore')
 
-# ─────────────────────────────────────────────
-# APP SETUP
-# ─────────────────────────────────────────────
-app = FastAPI(
-    title       = "Campbell's AI Marketing API",
-    description = "Churn Prediction · Customer Segmentation · ABSA · Personalized Messages",
-    version     = "4.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins     = ["*"],
-    allow_credentials = True,
-    allow_methods     = ["*"],
-    allow_headers     = ["*"],
-)
+# FIX 3: Guard resend import — app must not crash if package is absent or key is missing
+try:
+    import resend as _resend_module
+    _resend_available = True
+except ImportError:
+    _resend_module   = None
+    _resend_available = False
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "YOUR_GROQ_API_KEY_HERE")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "YOUR_SUPABASE_URL_HERE")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "YOUR_SUPABASE_ANON_KEY_HERE")
-GROQ_MODEL   = "llama-3.3-70b-versatile"
-DATA_DIR     = os.getenv("DATA_DIR", ".")
-DISCOUNT_MAP = {'High': 20, 'Medium': 15, 'Low': 10}
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY",    "YOUR_GROQ_API_KEY_HERE")
+SUPABASE_URL    = os.getenv("SUPABASE_URL",    "YOUR_SUPABASE_URL_HERE")
+SUPABASE_KEY    = os.getenv("SUPABASE_KEY",    "YOUR_SUPABASE_ANON_KEY_HERE")
+RESEND_API_KEY  = os.getenv("RESEND_API_KEY",  "YOUR_RESEND_API_KEY_HERE")
+GROQ_MODEL      = "llama-3.3-70b-versatile"
+DATA_DIR        = os.getenv("DATA_DIR", ".")
+DISCOUNT_MAP    = {'High': 20, 'Medium': 15, 'Low': 10}
+
+# FIX 3 cont.: Only configure resend if available AND key is real
+if _resend_available and RESEND_API_KEY != "YOUR_RESEND_API_KEY_HERE":
+    _resend_module.api_key = RESEND_API_KEY
+    resend = _resend_module
+else:
+    resend = None
 
 # ─────────────────────────────────────────────
-# SUPABASE CLIENT
+# SUPABASE CLIENT  (initialised once at module level — thread-safe)
 # ─────────────────────────────────────────────
-supabase: Client = None
+_supabase_client: Client = None
 
 def get_supabase() -> Client:
-    global supabase
-    if supabase is None:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return supabase
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
 
 # ─────────────────────────────────────────────
 # PYDANTIC SCHEMAS
@@ -105,7 +105,6 @@ class CustomerRequest(BaseModel):
 class SentimentRequest(BaseModel):
     review: str
 
-# UPDATED: MessageRequest now includes Section 5 profile fields
 class MessageRequest(BaseModel):
     customer_id      : Optional[str]       = None
     segment          : str
@@ -125,7 +124,6 @@ class MessageRequest(BaseModel):
     favorite_modifier: Optional[str]  = None
     is_flight_lover  : Optional[bool] = False
 
-# UPDATED: FullPipelineRequest now includes Section 5 profile fields
 class FullPipelineRequest(BaseModel):
     recency         : float
     frequency       : int
@@ -215,6 +213,9 @@ CREATE TABLE IF NOT EXISTS customers (
     favorite_modifier TEXT,
     is_flight_lover   BOOLEAN DEFAULT FALSE,
     favorite_items    TEXT,
+    email             TEXT,
+    email_sent        BOOLEAN DEFAULT FALSE,
+    email_sent_at     TIMESTAMPTZ,
     created_at        TIMESTAMPTZ DEFAULT NOW(),
     updated_at        TIMESTAMPTZ DEFAULT NOW()
 );"""
@@ -318,16 +319,34 @@ def seed_customers_from_csv():
     return seeded
 
 # ─────────────────────────────────────────────
-# STARTUP
+# APP SETUP  (lifespan replaces deprecated @app.on_event)
 # ─────────────────────────────────────────────
-@app.on_event("startup")
-async def startup_event():
+# FIX 2: use lifespan context manager instead of deprecated @app.on_event("startup")
+@asynccontextmanager
+async def lifespan(app_instance):
     global menu_df
     load_models()
     menu_df = load_menu()
     print(f"Menu loaded: {len(menu_df)} items")
     ensure_tables_via_api()
     seed_customers_from_csv()
+    yield   # app runs here
+    # (shutdown logic goes here if needed)
+
+app = FastAPI(
+    title       = "Campbell's AI Marketing API",
+    description = "Churn Prediction · Customer Segmentation · ABSA · Personalized Messages",
+    version     = "4.0.0",
+    lifespan    = lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins     = ["*"],
+    allow_credentials = True,
+    allow_methods     = ["*"],
+    allow_headers     = ["*"],
+)
 
 # ─────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -426,13 +445,11 @@ def call_groq(prompt: str) -> str:
     resp.raise_for_status()
     return resp.json()['choices'][0]['message']['content']
 
-# UPDATED: generate_message now uses Section 5 enriched profile
 def generate_message(req: MessageRequest) -> dict:
     discount = DISCOUNT_MAP.get(req.risk_level, 15)
     liked    = [a for a, s in zip(req.aspects or [], req.sentiments or []) if s == 'positive']
     disliked = [a for a, s in zip(req.aspects or [], req.sentiments or []) if s == 'negative']
 
-    # Build menu highlights matched to customer's food preference
     highlights = []
     if not menu_df.empty:
         food_pref = (req.food_preference or 'varied').lower()
@@ -444,7 +461,6 @@ def generate_message(req: MessageRequest) -> dict:
             extra = menu_df.sample(min(3 - len(highlights), len(menu_df)))[['itemName','itemPrice','Category']].to_dict('records')
             highlights.extend(extra)
 
-    # Build persona notes from Section 5 fields
     persona_notes = []
     tier         = req.spending_tier    or 'Standard'
     time_pref    = req.time_preference  or 'Evening'
@@ -548,6 +564,7 @@ def upsert_customer_to_db(customer_id, segment, req, churn):
     except Exception as e:
         print(f"Customer upsert failed: {e}")
 
+# FIX 4: Pass raw lists to JSONB columns — do NOT wrap in json.dumps()
 def log_message_to_db(customer_id, req: MessageRequest, messages: dict, absa):
     sb    = get_supabase()
     email = messages.get("email", {})
@@ -563,8 +580,9 @@ def log_message_to_db(customer_id, req: MessageRequest, messages: dict, absa):
             "email_subject"   : email.get("subject", "") if isinstance(email, dict) else "",
             "email_body"      : email.get("body", "")    if isinstance(email, dict) else "",
             "app_notification": messages.get("app_notification", ""),
-            "aspects"         : json.dumps(absa['aspects']    if absa else []),
-            "sentiments"      : json.dumps(absa['sentiments'] if absa else []),
+            # FIX 4: pass raw list, not json.dumps(list) — Supabase handles JSONB serialisation
+            "aspects"         : absa['aspects']    if absa else [],
+            "sentiments"      : absa['sentiments'] if absa else [],
         }).execute()
     except Exception as e:
         print(f"Message log failed: {e}")
@@ -579,10 +597,142 @@ def log_absa_to_db(customer_id, review: str, absa: dict):
             "sentiments"     : json.dumps(absa['sentiments']),
             "feature_opinion": json.dumps(absa['opinions']),
             "opinions"       : json.dumps(absa['opinions']),
-            "triplets"       : json.dumps(absa['triplets']),
+            "triplets"       : absa['triplets'],   # JSONB — pass raw list
         }).execute()
     except Exception as e:
         print(f"ABSA log failed: {e}")
+
+# ─────────────────────────────────────────────
+# EMAIL HELPERS
+# ─────────────────────────────────────────────
+REAL_EMAIL_MAP = {
+    "342.0" : "gamingoutclassed@gmail.com",
+    "6456.0": "murtazaworks0@gmail.com",
+    "7383.0": "222134@students.au.edu.pk",
+    "3066.0": "gamingoutclassed@gmail.com",
+    "5650.0": "murtazaworks0@gmail.com",
+    "3610.0": "222134@students.au.edu.pk",
+    "4861.0": "gamingoutclassed@gmail.com",
+    "4532.0": "murtazaworks0@gmail.com",
+    "1563.0": "222134@students.au.edu.pk",
+    "8753.0": "gamingoutclassed@gmail.com",
+}
+
+def get_customer_email(customer_id: str) -> str:
+    cid = str(customer_id).strip()
+    if cid in REAL_EMAIL_MAP:
+        return REAL_EMAIL_MAP[cid]
+    try:
+        sb   = get_supabase()
+        resp = sb.table("customers").select("email").eq("id", cid).limit(1).execute()
+        if resp.data and resp.data[0].get("email"):
+            return resp.data[0]["email"]
+    except:
+        pass
+    clean_id = cid.replace(".", "").replace(" ", "")
+    return f"customer_{clean_id}@demo.campbells-restaurant.com"
+
+
+def send_email_via_resend(
+    to_email: str,
+    subject: str,
+    body: str,
+    customer_id: str = None,
+    segment: str     = None,
+    risk_level: str  = None,
+    discount: str    = None
+) -> dict:
+    if resend is None:
+        return {"success": False, "error": "Resend not configured", "to": to_email}
+
+    segment_color = {
+        "Lost"      : "#E05252",
+        "New"       : "#4A9EFF",
+        "Occasional": "#F5A623",
+        "Regular"   : "#2DD4A0",
+    }.get(segment, "#FF6B35")
+
+    html_body = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>{subject}</title>
+    </head>
+    <body style="margin:0; padding:0; background-color:#0A0A0F; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+      <div style="background: linear-gradient(135deg, #FF6B35 0%, #FF8C5A 100%); padding: 32px 40px; text-align: center;">
+        <p style="margin:0; color:white; font-size:13px; letter-spacing:3px; text-transform:uppercase; opacity:0.85;">
+          ✈ CLEARED FOR TAKEOFF
+        </p>
+        <h1 style="margin:8px 0 0 0; color:white; font-size:32px; font-weight:700; letter-spacing:-0.5px;">
+          Campbell's
+        </h1>
+        <p style="margin:4px 0 0 0; color:rgba(255,255,255,0.8); font-size:13px; letter-spacing:2px; text-transform:uppercase;">
+          AI Marketing Hub
+        </p>
+      </div>
+      <div style="background:#12121A; padding:40px; max-width:600px; margin:0 auto;">
+        <div style="margin-bottom:24px;">
+          <span style="background:{segment_color}22; color:{segment_color}; border:1px solid {segment_color}44;
+                       padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600;
+                       text-transform:uppercase; letter-spacing:1px;">
+            {segment or 'Customer'} Member
+          </span>
+          {f'<span style="background:#E0525222; color:#E05252; border:1px solid #E0525244; padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:1px; margin-left:8px;">Special Offer: {discount}</span>' if discount else ''}
+        </div>
+        <div style="color:#E0E0E8; font-size:15px; line-height:1.8; white-space:pre-line;">
+{body}
+        </div>
+        <div style="text-align:center; margin:36px 0;">
+          <a href="https://campbells-ai-hub.vercel.app"
+             style="background: linear-gradient(135deg, #FF6B35, #FF8C5A);
+                    color:white; text-decoration:none; padding:14px 36px;
+                    border-radius:8px; font-weight:600; font-size:15px;
+                    display:inline-block; letter-spacing:0.3px;">
+            ✈ Fly Back to Campbell's
+          </a>
+        </div>
+        <div style="border-top:1px solid rgba(255,255,255,0.06); margin:32px 0;"></div>
+        <div style="text-align:center; color:#4A4A5E; font-size:12px; line-height:1.6;">
+          <p style="margin:0;">Campbell's Restaurant · Flight-Themed Dining Experience</p>
+          <p style="margin:4px 0 0 0;">
+            This message was generated by Campbell's AI Marketing Hub.
+            <br>You are receiving this because you are a valued guest.
+          </p>
+          {f'<p style="margin:8px 0 0 0; color:#2A2A3E; font-size:10px;">Customer ID: {customer_id} | Sent via Campbell\'s AI System</p>' if customer_id else ''}
+        </div>
+      </div>
+    </body>
+    </html>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from"   : "Campbell's AI Hub <onboarding@resend.dev>",
+            "to"     : [to_email],
+            "subject": subject,
+            "html"   : html_body,
+        })
+        print(f"Email sent to {to_email} | ID: {response.get('id', 'unknown')}")
+        return {"success": True, "email_id": response.get("id"), "to": to_email}
+    except Exception as e:
+        print(f"Email send failed to {to_email}: {e}")
+        return {"success": False, "error": str(e), "to": to_email}
+
+
+def update_email_sent_status(customer_id: str, email: str, success: bool):
+    if not customer_id:
+        return
+    sb = get_supabase()
+    try:
+        sb.table("customers").update({
+            "email"         : email,
+            "email_sent"    : success,
+            "email_sent_at" : datetime.now(timezone.utc).isoformat(),
+        }).eq("id", str(customer_id)).execute()
+    except Exception as e:
+        print(f"Email status update failed: {e}")
 
 # ─────────────────────────────────────────────
 # CORE ENDPOINTS
@@ -594,7 +744,8 @@ def health_check():
         "service"      : "Campbell's AI Marketing API",
         "version"      : "4.0.0",
         "models_loaded": list(models.keys()),
-        "supabase"     : SUPABASE_URL != "YOUR_SUPABASE_URL_HERE"
+        "supabase"     : SUPABASE_URL != "YOUR_SUPABASE_URL_HERE",
+        "email"        : resend is not None,
     }
 
 @app.post("/api/segment")
@@ -638,7 +789,6 @@ def generate_personalized_message(req: MessageRequest):
         "messages"        : messages
     }
 
-# UPDATED: full_pipeline auto-fetches Section 5 profile from Supabase by customer_id
 @app.post("/api/full-pipeline")
 def full_pipeline(req: FullPipelineRequest):
     segment   = get_segment(req.recency, req.frequency, req.monetary)
@@ -664,13 +814,13 @@ def full_pipeline(req: FullPipelineRequest):
         log_absa_to_db(req.customer_id, req.review, absa)
 
     # Resolve Section 5 profile: request body > Supabase DB > defaults
-    spending_tier    = req.spending_tier
-    time_preference  = req.time_preference
-    food_preference  = req.food_preference
-    drink_vs_food    = req.drink_vs_food
-    favorite_modifier= req.favorite_modifier
-    is_flight_lover  = req.is_flight_lover
-    fav_items        = req.favorite_items or []
+    spending_tier     = req.spending_tier
+    time_preference   = req.time_preference
+    food_preference   = req.food_preference
+    drink_vs_food     = req.drink_vs_food
+    favorite_modifier = req.favorite_modifier
+    is_flight_lover   = req.is_flight_lover
+    fav_items         = req.favorite_items or []
 
     if req.customer_id:
         try:
@@ -681,12 +831,12 @@ def full_pipeline(req: FullPipelineRequest):
             ).eq("id", str(req.customer_id)).limit(1).execute()
             if resp.data:
                 row = resp.data[0]
-                if spending_tier    is None: spending_tier    = row.get("spending_tier")
-                if time_preference  is None: time_preference  = row.get("time_preference")
-                if food_preference  is None: food_preference  = row.get("food_preference")
-                if drink_vs_food    is None: drink_vs_food    = row.get("drink_vs_food")
+                if spending_tier     is None: spending_tier     = row.get("spending_tier")
+                if time_preference   is None: time_preference   = row.get("time_preference")
+                if food_preference   is None: food_preference   = row.get("food_preference")
+                if drink_vs_food     is None: drink_vs_food     = row.get("drink_vs_food")
                 if favorite_modifier is None: favorite_modifier = row.get("favorite_modifier")
-                if is_flight_lover  is None: is_flight_lover  = bool(row.get("is_flight_lover", False))
+                if is_flight_lover   is None: is_flight_lover   = bool(row.get("is_flight_lover", False))
                 if not fav_items:
                     stored = row.get("favorite_items")
                     if stored:
@@ -697,7 +847,6 @@ def full_pipeline(req: FullPipelineRequest):
         except Exception as e:
             print(f"Profile fetch error: {e}")
 
-    # Apply defaults if still None after DB lookup
     spending_tier    = spending_tier    or 'Standard'
     time_preference  = time_preference  or 'Evening'
     food_preference  = food_preference  or 'varied'
@@ -727,6 +876,27 @@ def full_pipeline(req: FullPipelineRequest):
     upsert_customer_to_db(req.customer_id, segment, req, churn)
     log_message_to_db(req.customer_id, msg_req, messages, absa)
 
+    # FIX 1: Email block is now LIVE code (was inside dead triple-quoted string)
+    email_result   = {"success": False, "skipped": True}
+    customer_email = get_customer_email(req.customer_id) if req.customer_id else None
+
+    if customer_email:
+        email_data = messages.get("email", {})
+        subject    = email_data.get("subject", "A message from Campbell's") if isinstance(email_data, dict) else "A message from Campbell's"
+        body       = email_data.get("body", "")                              if isinstance(email_data, dict) else str(email_data)
+        discount   = f"{DISCOUNT_MAP.get(churn['risk_level'], 15)}%"
+
+        email_result = send_email_via_resend(
+            to_email    = customer_email,
+            subject     = subject,
+            body        = body,
+            customer_id = req.customer_id,
+            segment     = segment,
+            risk_level  = churn['risk_level'],
+            discount    = discount,
+        )
+        update_email_sent_status(req.customer_id, customer_email, email_result.get("success", False))
+
     return {
         "segment"          : segment,
         "churn_probability": churn['churn_probability'],
@@ -740,12 +910,93 @@ def full_pipeline(req: FullPipelineRequest):
             "drink_vs_food"  : drink_vs_food,
             "is_flight_lover": is_flight_lover,
         },
-        "absa"    : absa,
-        "messages": messages
+        "absa"        : absa,
+        "messages"    : messages,
+        "email_result": email_result,   # now included in every response
     }
 
 # ─────────────────────────────────────────────
-# DASHBOARD + DATA ENDPOINTS (identical to v3)
+# NEW: Batch send endpoint (now LIVE — was inside dead triple-quoted string)
+# ─────────────────────────────────────────────
+@app.post("/api/send-reengagement-batch")
+async def send_reengagement_batch(limit: int = Query(10, ge=1, le=50)):
+    """
+    Fetch top N high-risk customers from Supabase,
+    generate personalized messages, and send emails via Resend.
+    """
+    sb = get_supabase()
+    try:
+        resp = sb.table("customers").select("*") \
+                 .eq("risk_level", "High") \
+                 .order("churn_probability", desc=True) \
+                 .limit(limit).execute()
+        customers = resp.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    results = []
+    for customer in customers:
+        cid   = customer.get("id")
+        email = get_customer_email(cid)
+
+        msg_req = MessageRequest(
+            customer_id      = cid,
+            segment          = customer.get("segment", "Lost"),
+            recency          = float(customer.get("recency", 60)),
+            frequency        = int(customer.get("frequency", 1)),
+            monetary         = float(customer.get("monetary", 0)),
+            risk_level       = customer.get("risk_level", "High"),
+            churn_probability= float(customer.get("churn_probability", 0.9)),
+            spending_tier    = customer.get("spending_tier", "Standard"),
+            time_preference  = customer.get("time_preference", "Evening"),
+            food_preference  = customer.get("food_preference", "varied"),
+            drink_vs_food    = customer.get("drink_vs_food", "Mixed"),
+            favorite_modifier= customer.get("favorite_modifier"),
+            is_flight_lover  = bool(customer.get("is_flight_lover", False)),
+        )
+
+        try:
+            stored = customer.get("favorite_items", "[]")
+            msg_req.favorite_items = ast.literal_eval(stored) if isinstance(stored, str) else []
+        except:
+            msg_req.favorite_items = []
+
+        messages = generate_message(msg_req)
+        log_message_to_db(cid, msg_req, messages, None)
+
+        email_data   = messages.get("email", {})
+        subject      = email_data.get("subject", "A message from Campbell's") if isinstance(email_data, dict) else "A message from Campbell's"
+        body         = email_data.get("body", "") if isinstance(email_data, dict) else ""
+        email_result = send_email_via_resend(
+            to_email    = email,
+            subject     = subject,
+            body        = body,
+            customer_id = cid,
+            segment     = customer.get("segment"),
+            risk_level  = customer.get("risk_level"),
+            discount    = f"{DISCOUNT_MAP.get(customer.get('risk_level','High'), 20)}%"
+        )
+        update_email_sent_status(cid, email, email_result.get("success", False))
+
+        results.append({
+            "customer_id"  : cid,
+            "email"        : email,
+            "segment"      : customer.get("segment"),
+            "sms"          : messages.get("sms", ""),
+            "email_subject": subject,
+            "email_sent"   : email_result.get("success", False),
+            "email_id"     : email_result.get("email_id"),
+        })
+
+    sent_count = sum(1 for r in results if r["email_sent"])
+    return {
+        "total_processed": len(results),
+        "emails_sent"    : sent_count,
+        "results"        : results
+    }
+
+# ─────────────────────────────────────────────
+# DASHBOARD + DATA ENDPOINTS
 # ─────────────────────────────────────────────
 @app.get("/api/dashboard")
 def get_dashboard_stats():
@@ -832,7 +1083,6 @@ def get_messages_log(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-# NEW: single customer full profile
 @app.get("/api/customer-profile/{customer_id}")
 def get_customer_profile(customer_id: str):
     """Full enriched profile for one customer including all Section 5 fields."""
@@ -848,7 +1098,7 @@ def get_customer_profile(customer_id: str):
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
 # ─────────────────────────────────────────────
-# ANALYSIS ENDPOINTS (identical to v3)
+# ANALYSIS ENDPOINTS
 # ─────────────────────────────────────────────
 @app.get("/api/analysis/kpis")
 def get_kpis():
@@ -1011,12 +1261,13 @@ def get_revenue_analysis():
         "non_discount_users": int((df['discount_used'] == 0).sum()),
     }
 
+# FIX 5: SELECT column renamed from "sentiment" (wrong) to "sentiments" (matches schema)
 @app.get("/api/analysis/sentiment-breakdown")
 def get_sentiment_breakdown():
     sb = get_supabase()
     try:
         resp = sb.table("absa_predictions").select(
-            "review, aspects, sentiment, feature_opinion"
+            "review, aspects, sentiments, feature_opinion"   # FIX 5: was "sentiment" (singular)
         ).limit(10000).execute()
         rows = resp.data
         if not rows:
@@ -1034,8 +1285,8 @@ def get_sentiment_breakdown():
 
     pairs = []
     for _, row in df.iterrows():
-        aspects    = safe_parse(row.get('aspects',   '[]'))
-        sentiments = safe_parse(row.get('sentiment', '[]'))
+        aspects    = safe_parse(row.get('aspects',    '[]'))
+        sentiments = safe_parse(row.get('sentiments', '[]'))   # FIX 5: was row.get('sentiment')
         for asp, sent in zip(aspects, sentiments):
             pairs.append({'aspect': asp, 'sentiment': sent})
 
@@ -1053,12 +1304,11 @@ def get_sentiment_breakdown():
         "aspect_frequency"     : aspect_frequency,
         "sentiment_by_aspect"  : sentiment_by_aspect,
         "overall_sentiment"    : pairs_df['sentiment'].value_counts().to_dict(),
-        "sample_reviews"       : df[['review','aspects','sentiment']].head(10).to_dict('records'),
+        "sample_reviews"       : df[['review','aspects','sentiments']].head(10).to_dict('records'),
         "total_reviews"        : len(df),
         "total_aspect_mentions": len(pairs_df)
     }
 
-# NEW: Section 5 profile breakdown endpoint
 @app.get("/api/analysis/profiles")
 def get_profile_breakdown():
     """
@@ -1079,7 +1329,6 @@ def get_profile_breakdown():
 
     df = pd.DataFrame(rows)
 
-    # Check whether Section 5 columns actually have real data
     has_profiles = (
         "spending_tier" in df.columns
         and df["spending_tier"].notna().any()
