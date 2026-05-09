@@ -32,10 +32,11 @@ import pickle
 import json
 import re
 import os
-import ast          # FIX 1: moved to top-level imports (was only inside dead commented block)
+import ast
+import time
 import requests
 import warnings
-from contextlib import asynccontextmanager   # FIX 2: for lifespan (replaces deprecated on_event)
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from supabase import create_client, Client
 from sklearn.preprocessing import StandardScaler
@@ -48,7 +49,7 @@ from xgboost import XGBClassifier
 from openpyxl import load_workbook
 warnings.filterwarnings('ignore')
 
-# FIX 3: Guard resend import — app must not crash if package is absent or key is missing
+# Guard resend import — app must not crash if package is absent or key is missing
 try:
     import resend as _resend_module
     _resend_available = True
@@ -64,10 +65,10 @@ SUPABASE_URL    = os.getenv("SUPABASE_URL",    "YOUR_SUPABASE_URL_HERE")
 SUPABASE_KEY    = os.getenv("SUPABASE_KEY",    "YOUR_SUPABASE_ANON_KEY_HERE")
 RESEND_API_KEY  = os.getenv("RESEND_API_KEY",  "YOUR_RESEND_API_KEY_HERE")
 GROQ_MODEL      = "llama-3.3-70b-versatile"
-DATA_DIR        = os.getenv("DATA_DIR", ".")
+DATA_DIR        = os.getenv("DATA_DIR", "/app")   # PATCHED: was "." — set DATA_DIR=/app in Render env
 DISCOUNT_MAP    = {'High': 20, 'Medium': 15, 'Low': 10}
 
-# FIX 3 cont.: Only configure resend if available AND key is real
+# Only configure resend if available AND key is real
 if _resend_available and RESEND_API_KEY != "YOUR_RESEND_API_KEY_HERE":
     _resend_module.api_key = RESEND_API_KEY
     resend = _resend_module
@@ -283,8 +284,8 @@ def seed_customers_from_csv():
         if check.count and check.count >= len(df):
             print(f"customers already has {check.count} rows - skipping seed")
             return check.count
-    except:
-        pass
+    except Exception as e:
+        print(f"customers table check failed (may not exist yet): {e}")  # PATCHED: was bare except: pass
     print(f"Seeding {len(df)} customers...")
     col_map = {
         'Last 4 Card Digits':'id','Segment':'segment','Recency':'recency',
@@ -321,7 +322,6 @@ def seed_customers_from_csv():
 # ─────────────────────────────────────────────
 # APP SETUP  (lifespan replaces deprecated @app.on_event)
 # ─────────────────────────────────────────────
-# FIX 2: use lifespan context manager instead of deprecated @app.on_event("startup")
 @asynccontextmanager
 async def lifespan(app_instance):
     global menu_df
@@ -564,7 +564,6 @@ def upsert_customer_to_db(customer_id, segment, req, churn):
     except Exception as e:
         print(f"Customer upsert failed: {e}")
 
-# FIX 4: Pass raw lists to JSONB columns — do NOT wrap in json.dumps()
 def log_message_to_db(customer_id, req: MessageRequest, messages: dict, absa):
     sb    = get_supabase()
     email = messages.get("email", {})
@@ -580,7 +579,7 @@ def log_message_to_db(customer_id, req: MessageRequest, messages: dict, absa):
             "email_subject"   : email.get("subject", "") if isinstance(email, dict) else "",
             "email_body"      : email.get("body", "")    if isinstance(email, dict) else "",
             "app_notification": messages.get("app_notification", ""),
-            # FIX 4: pass raw list, not json.dumps(list) — Supabase handles JSONB serialisation
+            # Pass raw list — Supabase handles JSONB serialisation
             "aspects"         : absa['aspects']    if absa else [],
             "sentiments"      : absa['sentiments'] if absa else [],
         }).execute()
@@ -876,11 +875,16 @@ def full_pipeline(req: FullPipelineRequest):
     upsert_customer_to_db(req.customer_id, segment, req, churn)
     log_message_to_db(req.customer_id, msg_req, messages, absa)
 
-    # FIX 1: Email block is now LIVE code (was inside dead triple-quoted string)
-    email_result   = {"success": False, "skipped": True}
+    # PATCHED: Only send to real mapped emails — skip generated demo addresses
+    email_result   = {"success": False, "skipped": True, "reason": "no real email on file"}
     customer_email = get_customer_email(req.customer_id) if req.customer_id else None
 
-    if customer_email:
+    is_real_email = (
+        customer_email is not None
+        and "demo.campbells-restaurant.com" not in customer_email
+    )
+
+    if is_real_email:
         email_data = messages.get("email", {})
         subject    = email_data.get("subject", "A message from Campbell's") if isinstance(email_data, dict) else "A message from Campbell's"
         body       = email_data.get("body", "")                              if isinstance(email_data, dict) else str(email_data)
@@ -912,17 +916,18 @@ def full_pipeline(req: FullPipelineRequest):
         },
         "absa"        : absa,
         "messages"    : messages,
-        "email_result": email_result,   # now included in every response
+        "email_result": email_result,
     }
 
 # ─────────────────────────────────────────────
-# NEW: Batch send endpoint (now LIVE — was inside dead triple-quoted string)
+# BATCH SEND ENDPOINT
 # ─────────────────────────────────────────────
 @app.post("/api/send-reengagement-batch")
 async def send_reengagement_batch(limit: int = Query(10, ge=1, le=50)):
     """
     Fetch top N high-risk customers from Supabase,
     generate personalized messages, and send emails via Resend.
+    Only sends to customers with real mapped emails — demo addresses are skipped.
     """
     sb = get_supabase()
     try:
@@ -961,32 +966,46 @@ async def send_reengagement_batch(limit: int = Query(10, ge=1, le=50)):
         except:
             msg_req.favorite_items = []
 
+        # PATCHED: 800ms delay between Groq calls — prevents free-tier 429 rate limit errors
         messages = generate_message(msg_req)
         log_message_to_db(cid, msg_req, messages, None)
 
-        email_data   = messages.get("email", {})
-        subject      = email_data.get("subject", "A message from Campbell's") if isinstance(email_data, dict) else "A message from Campbell's"
-        body         = email_data.get("body", "") if isinstance(email_data, dict) else ""
-        email_result = send_email_via_resend(
-            to_email    = email,
-            subject     = subject,
-            body        = body,
-            customer_id = cid,
-            segment     = customer.get("segment"),
-            risk_level  = customer.get("risk_level"),
-            discount    = f"{DISCOUNT_MAP.get(customer.get('risk_level','High'), 20)}%"
+        email_data = messages.get("email", {})
+        subject    = email_data.get("subject", "A message from Campbell's") if isinstance(email_data, dict) else "A message from Campbell's"
+        body       = email_data.get("body", "") if isinstance(email_data, dict) else ""
+
+        # PATCHED: Only send to real mapped emails — skip generated demo addresses
+        is_real_email = (
+            email is not None
+            and "demo.campbells-restaurant.com" not in email
         )
-        update_email_sent_status(cid, email, email_result.get("success", False))
+
+        if is_real_email:
+            email_result = send_email_via_resend(
+                to_email    = email,
+                subject     = subject,
+                body        = body,
+                customer_id = cid,
+                segment     = customer.get("segment"),
+                risk_level  = customer.get("risk_level"),
+                discount    = f"{DISCOUNT_MAP.get(customer.get('risk_level','High'), 20)}%"
+            )
+            update_email_sent_status(cid, email, email_result.get("success", False))
+        else:
+            email_result = {"success": False, "skipped": True, "reason": "demo address"}
 
         results.append({
             "customer_id"  : cid,
             "email"        : email,
+            "real_email"   : is_real_email,
             "segment"      : customer.get("segment"),
             "sms"          : messages.get("sms", ""),
             "email_subject": subject,
             "email_sent"   : email_result.get("success", False),
             "email_id"     : email_result.get("email_id"),
         })
+
+        time.sleep(0.8)   # rate-limit buffer between Groq calls
 
     sent_count = sum(1 for r in results if r["email_sent"])
     return {
@@ -1261,13 +1280,12 @@ def get_revenue_analysis():
         "non_discount_users": int((df['discount_used'] == 0).sum()),
     }
 
-# FIX 5: SELECT column renamed from "sentiment" (wrong) to "sentiments" (matches schema)
 @app.get("/api/analysis/sentiment-breakdown")
 def get_sentiment_breakdown():
     sb = get_supabase()
     try:
         resp = sb.table("absa_predictions").select(
-            "review, aspects, sentiments, feature_opinion"   # FIX 5: was "sentiment" (singular)
+            "review, aspects, sentiments, feature_opinion"
         ).limit(10000).execute()
         rows = resp.data
         if not rows:
@@ -1286,7 +1304,7 @@ def get_sentiment_breakdown():
     pairs = []
     for _, row in df.iterrows():
         aspects    = safe_parse(row.get('aspects',    '[]'))
-        sentiments = safe_parse(row.get('sentiments', '[]'))   # FIX 5: was row.get('sentiment')
+        sentiments = safe_parse(row.get('sentiments', '[]'))
         for asp, sent in zip(aspects, sentiments):
             pairs.append({'aspect': asp, 'sentiment': sent})
 
